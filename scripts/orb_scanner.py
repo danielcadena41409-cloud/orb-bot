@@ -150,11 +150,12 @@ def occ_symbol(underlying: str, expiry: datetime.date, opt_type: str, strike: fl
     return f"{underlying}{exp_str}{type_ch}{strike_i:08d}"
 
 def get_option_snapshot(symbol: str) -> dict | None:
-    """Fetch option snapshot (includes greeks + latest quote)."""
-    url = f"{DATA_URL}/v2/snapshots/options/{symbol}"
+    """Fetch option snapshot via v1beta1 snapshots endpoint."""
+    url = f"{DATA_URL}/v1beta1/options/snapshots"
     try:
-        data = get(url)
-        return data
+        data = get(url, {"symbols": symbol})
+        snaps = data.get("snapshots", {})
+        return snaps.get(symbol)
     except Exception:
         return None
 
@@ -173,21 +174,19 @@ def find_valid_option(direction: str, spy_price: float) -> tuple[str, float] | t
         sym = occ_symbol("SPY", expiry, direction, float(strike))
         snap = get_option_snapshot(sym)
         if snap:
-            # Extract mid price from snapshot
-            q = snap.get("latestQuote", {})
-            ap, bp = q.get("ap", 0), q.get("bp", 0)
+            # latestQuote from v1beta1 snapshot
+            q  = snap.get("latestQuote", {})
+            ap = q.get("ap", 0)
+            bp = q.get("bp", 0)
             if ap and bp:
                 mid = round((ap + bp) / 2, 2)
                 if mid > 0:
                     return sym, mid
-            # try greeks
-            gp = snap.get("greeks", {})
-            if gp.get("delta") is not None:
-                # snapshot exists, try latest trade
-                lt = snap.get("latestTrade", {})
-                px = lt.get("p", 0)
-                if px > 0:
-                    return sym, px
+            # fall back to latest trade price
+            lt = snap.get("latestTrade", {})
+            px = lt.get("p", 0)
+            if px > 0:
+                return sym, px
     return None, None
 
 # ── Position store ────────────────────────────────────────────────────────────
