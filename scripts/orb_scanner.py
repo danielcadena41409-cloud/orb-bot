@@ -162,6 +162,13 @@ def fetch_latest_quote(symbol: str) -> float | None:
         return round((ap + bp) / 2, 2)
     return None
 
+def orb_window() -> tuple[str, str]:
+    """Return (start_iso, end_iso) for the 9:30–9:45 ET ORB window with correct DST offset."""
+    today    = now_et().date()
+    start_dt = datetime.datetime(today.year, today.month, today.day, 9, 30, 0, tzinfo=ET)
+    end_dt   = datetime.datetime(today.year, today.month, today.day, 9, 45, 0, tzinfo=ET)
+    return start_dt.isoformat(), end_dt.isoformat()
+
 # ── Options helpers ───────────────────────────────────────────────────────────
 def nearest_friday(from_date: datetime.date, max_days: int = 7) -> datetime.date | None:
     for delta in range(1, max_days + 2):
@@ -195,7 +202,8 @@ def option_mid(snap: dict) -> float:
 def find_valid_option(underlying: str, direction: str, price: float) -> tuple[str, float] | tuple[None, None]:
     today = now_et().date()
     for extra in range(3):
-        expiry = nearest_friday(today, max_days=7 + extra * 7)
+        # Use week offsets so each iteration tries a different Friday (not always the nearest one)
+        expiry = nearest_friday(today + datetime.timedelta(weeks=extra))
         if expiry is None:
             continue
         strike = round(price + STRIKE_OFFSET if direction == "call" else price - STRIKE_OFFSET)
@@ -318,9 +326,7 @@ def phase_range_definition(min_range_pct: float) -> dict[str, dict]:
         time.sleep(30)
     print()
 
-    date_str = now_et().date().isoformat()
-    start    = f"{date_str}T09:30:00-04:00"
-    end      = f"{date_str}T09:45:00-04:00"
+    start, end = orb_window()
 
     results = {}
     print()
@@ -409,8 +415,12 @@ def phase_breakout_watch(
         if first_tick:
             first_tick = False
             for sym in valid_syms:
-                bar = fetch_latest_bar(sym)
-                px  = bar["c"] if bar else 0
+                try:
+                    bar = fetch_latest_bar(sym)
+                except Exception as e:
+                    warn(f"  API error fetching {sym}: {e}")
+                    bar = None
+                px = bar.get("c", 0) if bar else 0
                 info(f"[{ts_str}] {sym} ${px:.2f} | Skipping first candle after range")
             continue
 
@@ -418,9 +428,24 @@ def phase_breakout_watch(
         breakouts: list[tuple[str, str, float]] = []   # (symbol, direction, price)
 
         for sym in valid_syms:
-            bar = fetch_latest_bar(sym)
+            try:
+                bar = fetch_latest_bar(sym)
+            except Exception as e:
+                warn(f"  API error fetching {sym}: {e} — skipping tick")
+                continue
             if not bar:
                 continue
+            # Stale data guard: skip bars older than 3 minutes
+            bar_ts = bar.get("t", "")
+            if bar_ts:
+                try:
+                    bar_dt = datetime.datetime.fromisoformat(bar_ts.replace("Z", "+00:00"))
+                    age    = (datetime.datetime.now(datetime.timezone.utc) - bar_dt).total_seconds()
+                    if age > 180:
+                        warn(f"  {sym} bar is {int(age)}s old (stale) — skipping")
+                        continue
+                except Exception:
+                    pass
             o, c      = bar["o"], bar["c"]
             body_high = max(o, c)
             body_low  = min(o, c)
@@ -521,9 +546,11 @@ def phase_position_monitor(
 
     # ── Qty ───────────────────────────────────────────────────────────────────
     cost_per = opt_mid * 100
-    qty      = max(1, math.floor(MAX_BUDGET / cost_per))
-    if qty * cost_per > MAX_BUDGET and qty > 1:
-        qty -= 1
+    qty      = math.floor(MAX_BUDGET / cost_per)
+    if qty == 0:
+        err(f"Option at ${opt_mid:.2f}/contract (${cost_per:.0f}/lot) exceeds ${MAX_BUDGET} budget — aborting.")
+        session.update({"entry_symbol": opt_sym, "exit_reason": "option too expensive for budget"})
+        return session
     total_cost = qty * cost_per
 
     info(f"Buying {B}{qty}{R} contract(s) — est. cost ${total_cost:.2f}")
@@ -572,23 +599,38 @@ def phase_position_monitor(
     time_stop   = now_et().replace(hour=11, minute=0, second=0, microsecond=0)
     exit_reason = "time stop"
     exit_price  = entry_price
+    last_price  = entry_price   # tracks last valid mid for time-stop P&L
 
-    while now_et() < time_stop:
+    while True:
         time.sleep(60)
-        ts_str = now_et().strftime("%I:%M %p")
+        n = now_et()
+
+        # Time-stop check AFTER sleep so the close fires promptly at 11:00
+        if n >= time_stop:
+            exit_price  = last_price
+            exit_reason = "time stop"
+            print()
+            warn("TIME STOP — CLOSING ALL POSITIONS")
+            break
+
+        ts_str = n.strftime("%I:%M %p")
 
         snap          = get_option_snapshot(opt_sym)
-        current_price = entry_price
+        current_price = last_price
         if snap:
             mid = option_mid(snap)
             if mid > 0:
                 current_price = mid
+                last_price    = current_price
 
         pnl_pct  = (current_price - entry_price) / entry_price
         pnl_dol  = (current_price - entry_price) * 100 * qty
         pnl_col  = GR if pnl_pct >= 0 else RD
         pnl_sign = "+" if pnl_pct >= 0 else ""
-        und_now  = fetch_latest_quote(underlying) or 0
+        try:
+            und_now = fetch_latest_quote(underlying) or 0
+        except Exception:
+            und_now = 0
 
         print(
             f"  {DM}[{ts_str}]{R}  {B}{opt_sym}{R}"
@@ -611,9 +653,6 @@ def phase_position_monitor(
             exit_reason = f"stop loss {pnl_pct*100:.1f}%"
             exit_price  = current_price
             break
-    else:
-        print()
-        warn("TIME STOP — CLOSING ALL POSITIONS")
 
     # ── Close ─────────────────────────────────────────────────────────────────
     close_position(opt_sym, qty)
@@ -661,9 +700,7 @@ def wait_until(hour: int, minute: int, label: str) -> None:
 
 # ── ORB bars fetch helper (used when already past 9:45) ──────────────────────
 def fetch_orb_bars(min_range_pct: float) -> dict[str, dict]:
-    date_str = now_et().date().isoformat()
-    start    = f"{date_str}T09:30:00-04:00"
-    end      = f"{date_str}T09:45:00-04:00"
+    start, end = orb_window()
     results  = {}
     for sym in WATCHLIST:
         bars = fetch_bars(sym, start, end)
@@ -685,6 +722,41 @@ def fetch_orb_bars(min_range_pct: float) -> dict[str, dict]:
         }
     return results
 
+# ── Stale position guard ─────────────────────────────────────────────────────
+def check_stale_positions() -> None:
+    """Close positions from previous days; exit if a same-day position is still open."""
+    positions = load_positions()
+    if not positions:
+        return
+    today = now_et().date()
+    stale: dict = {}
+    same_day: dict = {}
+    for sym, pos in positions.items():
+        try:
+            entry_date = datetime.datetime.fromisoformat(pos["entered_at"]).astimezone(ET).date()
+        except Exception:
+            entry_date = None
+        if entry_date != today:
+            stale[sym] = pos
+        else:
+            same_day[sym] = pos
+
+    if stale:
+        warn(f"Found {len(stale)} stale position(s) from a previous session — closing:")
+        for sym, pos in stale.items():
+            warn(f"  {sym}  qty={pos.get('qty')}  entered {pos.get('entered_at', 'unknown')}")
+            close_position(sym, pos.get("qty", 1))
+        for sym in stale:
+            positions.pop(sym, None)
+        save_positions(positions)
+
+    if same_day:
+        warn(f"Found {len(same_day)} open position(s) from earlier today — already traded this session.")
+        for sym, pos in same_day.items():
+            warn(f"  {sym}  qty={pos.get('qty')}  entered {pos.get('entered_at', 'unknown')}")
+        warn("Close manually or delete data/orb_positions.json, then restart.")
+        sys.exit(0)
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main() -> None:
     print()
@@ -695,6 +767,9 @@ def main() -> None:
     print(f"  Symbols  : {', '.join(WATCHLIST)}")
     print(f"  Started  : {now_et().strftime('%Y-%m-%d %I:%M:%S %p ET')}")
     print()
+
+    # ── Stale position check ──────────────────────────────────────────────────
+    check_stale_positions()
 
     # ── Regime ────────────────────────────────────────────────────────────────
     regime, min_range_pct = load_regime()
@@ -777,3 +852,17 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print(f"\n{YL}  Interrupted by user. Exiting cleanly.{R}\n")
         sys.exit(0)
+    except Exception as _exc:
+        import traceback
+        print(f"\n{B}{RD}  FATAL ERROR: {_exc}{R}")
+        traceback.print_exc()
+        try:
+            _positions = load_positions()
+            if _positions:
+                warn("Emergency closing open positions after fatal error...")
+                for _sym, _pos in _positions.items():
+                    close_position(_sym, _pos.get("qty", 1))
+                save_positions({})
+        except Exception as _ce:
+            err(f"Emergency close failed: {_ce}")
+        sys.exit(1)
