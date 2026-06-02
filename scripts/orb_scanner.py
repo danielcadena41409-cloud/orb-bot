@@ -105,7 +105,7 @@ def load_regime() -> tuple[str, float]:
         "BULL_TRENDING":   0.003,
         "BEAR_TRENDING":   0.003,
         "HIGH_VOLATILITY": 0.003,   # irrelevant — session is skipped
-        "SIDEWAYS":        0.005,
+        "SIDEWAYS":        0.003,
     }.get(regime, 0.005)
 
     return regime, min_range

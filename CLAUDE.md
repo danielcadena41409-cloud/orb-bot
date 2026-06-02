@@ -14,7 +14,7 @@ Reads `~/trading-agent/data/regime.json` at startup before Phase 1.
 | BULL_TRENDING | 0.3% | Favor calls — if tie on opposite dirs, take call |
 | BEAR_TRENDING | 0.3% | Favor puts — if tie on opposite dirs, take put |
 | HIGH_VOLATILITY | — | **Skip entire session** |
-| SIDEWAYS | **0.5%** | Neutral — SPY wins all ties |
+| SIDEWAYS | 0.3% | Neutral — SPY wins all ties |
 | *(file missing)* | 0.5% | Defaults to SIDEWAYS rules |
 
 ### Three-Phase Logic
